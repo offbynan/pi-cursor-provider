@@ -650,6 +650,9 @@ export async function startProxy(
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;
         proxyServer = server;
+        // Don't hold the event loop open — pi -p must be able to exit cleanly
+        // after a response without an explicit shutdown signal.
+        server.unref();
         debugLog("proxy.start", {
           port: proxyPort,
           debugLogFile: isProxyDebugEnabled()
@@ -2031,6 +2034,8 @@ function startBridge(accessToken: string, requestBytes: Uint8Array) {
     () => bridge.write(makeHeartbeatBytes()),
     5_000,
   );
+  // Don't hold the event loop open between heartbeats.
+  heartbeatTimer.unref();
   return { bridge, heartbeatTimer };
 }
 
@@ -2592,17 +2597,23 @@ async function handleNonStreamingResponse(
                       result: {
                         case: "error",
                         value: create(McpErrorSchema, {
-                          error: "Tool calls not supported in non-streaming mode",
+                          error:
+                            "Tool calls not supported in non-streaming mode",
                         }),
                       },
                     }) as any,
                   },
                 });
                 const clientMessage = create(AgentClientMessageSchema, {
-                  message: { case: "execClientMessage", value: execClientMessage },
+                  message: {
+                    case: "execClientMessage",
+                    value: execClientMessage,
+                  },
                 });
                 bridge.write(
-                  frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
+                  frameConnectMessage(
+                    toBinary(AgentClientMessageSchema, clientMessage),
+                  ),
                 );
                 debugLog("nonstream.exec_rejected", { requestId, exec });
               },
