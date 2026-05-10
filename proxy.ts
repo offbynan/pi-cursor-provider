@@ -412,6 +412,10 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
   proc.on("exit", (code) => {
     exited = true;
     exitCode = code ?? 1;
+    // Destroy stdio pipes immediately so their handles don't keep the event
+    // loop alive after the bridge exits (critical for `pi -p` to exit cleanly).
+    try { proc.stdout!.destroy(); } catch {}
+    try { proc.stdin!.destroy(); } catch {}
     debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
     cbs.close?.(exitCode);
   });
@@ -606,6 +610,10 @@ export async function startProxy(
         headers: req.headers,
       });
 
+      // Prevent HTTP keep-alive from holding the event loop open after a
+      // response completes (critical for `pi -p` to exit cleanly).
+      res.setHeader("Connection", "close");
+
       if (req.method === "GET" && url.pathname === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ object: "list", data: [] }));
@@ -650,6 +658,10 @@ export async function startProxy(
         // Don't hold the event loop open — pi -p must be able to exit cleanly
         // after a response without an explicit shutdown signal.
         server.unref();
+        // unref() only covers the listening socket; accepted connection sockets
+        // are ref'd by default. Unref each accepted socket so keep-alive HTTP
+        // connections don't prevent process exit either.
+        server.on("connection", (socket) => socket.unref());
         debugLog("proxy.start", {
           port: proxyPort,
           debugLogFile: isProxyDebugEnabled()
@@ -1949,7 +1961,7 @@ function respondWithPendingToolCalls(
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+      Connection: "close",
     });
     for (const toolCall of toolCalls) {
       res.write(
@@ -2107,7 +2119,7 @@ function writeSSEStream(
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    Connection: "keep-alive",
+    Connection: "close",
   });
 
   let closed = false;

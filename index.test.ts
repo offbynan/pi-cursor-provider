@@ -2285,3 +2285,61 @@ describe("proxy hang fixes", () => {
     expect(followUp.statusCode).toBe(200);
   });
 });
+
+describe("process exit safety (pi -p)", () => {
+  test("streaming response sends Connection: close so the client socket is not kept alive", async () => {
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (_msg, fake) => {
+        setTimeout(() => {
+          fake.emitServerMessage(makeTextDeltaMessage("hello"));
+          fake.emitServerMessage(makeCheckpointMessage());
+          fake.close(0);
+        }, 0);
+      });
+      return bridge;
+    });
+
+    const port = await startProxy(async () => "test-token");
+
+    const result = await new Promise<{
+      connectionHeader: string | undefined;
+      socketDestroyed: boolean;
+    }>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port,
+          path: "/v1/chat/completions",
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        },
+        (res) => {
+          const connectionHeader = res.headers["connection"] as
+            | string
+            | undefined;
+          res.setEncoding("utf8");
+          res.on("data", () => {});
+          res.on("end", () => {
+            setImmediate(() => {
+              resolve({
+                connectionHeader,
+                socketDestroyed: res.socket?.destroyed ?? true,
+              });
+            });
+          });
+          res.on("error", reject);
+        },
+      );
+      req.on("error", reject);
+      req.end(
+        JSON.stringify({
+          model: "gpt-5",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      );
+    });
+
+    expect(result.connectionHeader).toBe("close");
+    expect(result.socketDestroyed).toBe(true);
+  });
+});
