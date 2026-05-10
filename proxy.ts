@@ -2580,7 +2580,32 @@ async function handleNonStreamingResponse(
                 fullText += content;
                 appendAssistantTextToTurn(currentTurn, content);
               },
-              () => {},
+              (exec) => {
+                // Non-streaming mode cannot pause for tool calls. Reject each
+                // exec request immediately so Cursor can complete the turn.
+                const execClientMessage = create(ExecClientMessageSchema, {
+                  id: exec.execMsgId,
+                  execId: exec.execId,
+                  message: {
+                    case: "mcpResult" as any,
+                    value: create(McpResultSchema, {
+                      result: {
+                        case: "error",
+                        value: create(McpErrorSchema, {
+                          error: "Tool calls not supported in non-streaming mode",
+                        }),
+                      },
+                    }) as any,
+                  },
+                });
+                const clientMessage = create(AgentClientMessageSchema, {
+                  message: { case: "execClientMessage", value: execClientMessage },
+                });
+                bridge.write(
+                  frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
+                );
+                debugLog("nonstream.exec_rejected", { requestId, exec });
+              },
               (checkpointBytes) => {
                 latestCheckpoint = checkpointBytes;
                 const stored = conversationStates.get(convKey);
