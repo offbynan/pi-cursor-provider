@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-> **This fork adds image support.** You can send images alongside text in chat completions. The upstream repo does not support this — it only handles plain text messages. See [Image Support](#image-support) below.
+> **This fork improves on the upstream in three areas:** image support, correct `pi -p` exit behaviour, and removal of dead eviction code. See the sections below for details.
 
 [![npm version](https://img.shields.io/npm/v/pi-cursor-provider.svg)](https://www.npmjs.com/package/pi-cursor-provider)
 
@@ -8,7 +8,9 @@
 
 Forked from [ndraiman/pi-cursor-provider](https://github.com/ndraiman/pi-cursor-provider).
 
-## Image Support
+## Changes vs upstream
+
+### Image support
 
 This fork extends the proxy to handle images in OpenAI-style `image_url` content parts:
 
@@ -17,6 +19,19 @@ This fork extends the proxy to handle images in OpenAI-style `image_url` content
 - **Transparent to callers** — no API changes; just include standard `image_url` content parts in your messages as you would with any OpenAI-compatible client.
 
 The upstream repo does not support images at all — they are silently ignored or cause request failures. This fork handles them properly end-to-end.
+
+### `pi -p` exit fix
+
+The upstream repo causes `pi -p` (non-interactive mode) to hang indefinitely after printing a response. Two bugs were responsible:
+
+1. **Empty end-stream body misclassified as error.** Cursor's Connect end-stream frame often has a 0-byte body. `JSON.parse("")` throws, so the proxy took the error path even on clean completions.
+2. **Bridge never unref'd on error path.** `bridge.end()` and `bridge.unref()` were only called in the success branch. On the error path the h2-bridge child process stayed ref'd, blocking process exit.
+
+This fork fixes both: empty and non-JSON end-stream bodies are treated as success, and the bridge is always unref'd regardless of the outcome.
+
+### Removed dead eviction code
+
+The upstream proxy included a 30-minute TTL eviction mechanism (`evictStaleConversations`, `CONVERSATION_TTL_MS`, `sessionScoped`, `lastAccessMs`). All conversations created by pi include a session ID, permanently exempting them from TTL eviction, so this code was never reachable. This fork removes it.
 
 ## How it works
 
