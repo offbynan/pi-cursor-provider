@@ -156,6 +156,7 @@ interface BridgeHandle {
   readonly alive: boolean;
   write(data: Uint8Array): void;
   end(): void;
+  unref(): void;
   onData(cb: (chunk: Buffer) => void): void;
   onClose(cb: (code: number) => void): void;
 }
@@ -438,6 +439,12 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     },
     onData(cb: (chunk: Buffer) => void) {
       cbs.data = cb;
+    },
+    unref() {
+      try {
+        proc.unref();
+        (proc.stdout as any)?.unref?.();
+      } catch {}
     },
     onClose(cb: (code: number) => void) {
       if (exited) {
@@ -1912,6 +1919,7 @@ function createConnectFrameParser(
 }
 
 function parseConnectEndStream(data: Uint8Array): Error | null {
+  if (data.length === 0) return null;
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
@@ -1921,7 +1929,7 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
       );
     return null;
   } catch {
-    return new Error("Failed to parse Connect end stream");
+    return null;
   }
 }
 
@@ -2289,6 +2297,11 @@ function writeSSEStream(
     },
     (endStreamBytes) => {
       const endError = parseConnectEndStream(endStreamBytes);
+      // Always stop heartbeats and unref the bridge regardless of error/success
+      // so the parent process is not kept alive waiting for HTTP/2 END_STREAM.
+      clearInterval(heartbeatTimer);
+      bridge.end();
+      bridge.unref();
       if (endError) {
         console.error(
           `[cursor-provider] Cursor stream error (${modelId}):`,
@@ -2296,6 +2309,21 @@ function writeSSEStream(
         );
         conversationStates.delete(convKey);
         sendSSE(makeChunk({ content: endError.message }, "error"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
+      } else {
+        // Cursor's Connect-level response is complete. Send the SSE response
+        // immediately without waiting for HTTP/2 END_STREAM, which Cursor can
+        // delay by several seconds after the Connect end-stream frame.
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning)
+          sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) {
+          appendAssistantTextToTurn(currentTurn, flushed.content);
+          sendSSE(makeChunk({ content: flushed.content }));
+        }
+        sendSSE(makeChunk({}, "stop"));
         sendSSE(makeUsageChunk());
         sendDone();
         closeResponse();
@@ -2632,6 +2660,10 @@ async function handleNonStreamingResponse(
         },
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
+          // Always unref regardless of error/success.
+          clearInterval(heartbeatTimer);
+          bridge.end();
+          bridge.unref();
           if (endError) {
             console.error(
               `[cursor-provider] Cursor non-stream error (${modelId}):`,
