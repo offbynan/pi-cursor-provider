@@ -118,7 +118,7 @@
     "contextWindow": 200000,
     "maxTokens": 64000
   },
-    {
+  {
     "id": "composer-2.5",
     "name": "Composer 2.5",
     "reasoning": false,
