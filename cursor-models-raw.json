@@ -118,6 +118,20 @@
     "contextWindow": 200000,
     "maxTokens": 64000
   },
+    {
+    "id": "composer-2.5",
+    "name": "Composer 2.5",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "composer-2.5-fast",
+    "name": "Composer 2.5 Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
   {
     "id": "default",
     "name": "Auto",
