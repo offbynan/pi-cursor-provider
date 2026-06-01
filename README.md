@@ -1,23 +1,12 @@
 # pi-cursor-provider
 
-**This fork improves on the upstream in sixteen areas:**
+**This fork improves on the upstream across five areas:**
 
-- **Image support** — base64 `image_url` content parts are forwarded to Cursor end-to-end; the upstream silently drops them
-- **`pi -p` exit fix** — non-interactive mode no longer hangs after printing a response
-- **Dead eviction code removed** — unreachable 30-minute TTL eviction logic is gone
-- **Accurate context windows** — per-model inference instead of a hardcoded 200 k for every model
-- **Post-compaction sync** — cached checkpoint is cleared on `session_compact` so both sides stay in sync
-- **Context window scaling** — token counts are scaled when Cursor enforces a tighter runtime cap than the model implies
-- **Per-model cost estimation** — detailed price table (input / output / cache) covering all current model families
-- **Model deduplication** — effort-suffix variants (`-low`, `-medium`, `-high`, …) are collapsed into one entry; pi's reasoning-level setting drives the suffix automatically
-- **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags are stripped from the response and routed to `reasoning_content`
-- **Structured debug logging** — opt-in JSONL event log (`PI_CURSOR_PROVIDER_DEBUG=1`) with a bundled timeline viewer
-- **Bridge timeout hardening** — initial and activity timeouts raised and made configurable so large checkpoints don't cause premature bridge termination during compaction
-- **Bridge termination error propagation** — a bridge crash now surfaces as a real error to pi instead of returning a silent empty success, preventing compaction failures from appearing as blank responses
-- **Conversation history archiving** — turns beyond a configurable tail are folded into a `ConversationSummaryArchive` blob with inline text, capping `getBlobArgs` round-trips at O(tail) instead of O(history length) and dramatically speeding up compaction on long sessions
-- **SSE keepalive during blob-fetching** — periodic `: ping` comments keep the SSE connection alive while Cursor is fetching blobs, preventing pi's request timeout from firing before the first token arrives
-- **Conversation state preserved on transient errors** — a bridge timeout or Connect error no longer wipes the conversation state; the last good checkpoint survives so the next request resumes in-place instead of rebuilding from scratch
-- **Checkpoint saved on client disconnect** — if pi closes the connection (e.g. request timeout) after Cursor already sent a checkpoint, that checkpoint is preserved for the retry
+- **Reliability** — bridge timeouts hardened and configurable; errors surface as real failures instead of silent empty responses; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
+- **Model support** — per-model context window inference (vs. hardcoded 200 k); runtime cap scaling when Cursor enforces a tighter window; detailed cost table for all current families; effort-suffix variants deduplicated so pi's reasoning-level setting drives the suffix automatically
+- **Long conversations** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); checkpoint cleared on `session_compact` to keep both sides in sync
+- **Missing features** — base64 image support forwarded end-to-end; inline `<think>` / `<reasoning>` tags stripped and routed to `reasoning_content`
+- **Fixes & observability** — `pi -p` exit hang fixed; dead TTL eviction code removed; opt-in JSONL debug logging with a bundled timeline viewer
 
 [Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models (Claude, GPT, Gemini, Grok, Kimi, Composer) via OAuth and a local OpenAI-compatible proxy.
 
