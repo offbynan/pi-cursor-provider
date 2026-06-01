@@ -1,5 +1,60 @@
 # pi-cursor-provider
 
+[Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models (Claude, GPT, Gemini, Grok, Kimi, Composer) via OAuth and a local OpenAI-compatible proxy.
+
+[![npm version](https://img.shields.io/npm/v/@offbynan/pi-cursor-provider.svg)](https://www.npmjs.com/package/@offbynan/pi-cursor-provider)
+
+Forked from [ndraiman/pi-cursor-provider](https://github.com/ndraiman/pi-cursor-provider).
+
+## Install
+
+```bash
+# Via pi
+pi install npm:@offbynan/pi-cursor-provider
+
+# Or manually
+git clone https://github.com/offbynan/pi-cursor-provider ~/.pi/agent/extensions/cursor-provider
+cd ~/.pi/agent/extensions/cursor-provider
+npm install
+```
+
+## Usage
+
+```
+/login cursor     # authenticate via browser
+/model            # select a Cursor model
+```
+
+## How it works
+
+```
+pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
+                                      ↓
+                              proxy.ts (HTTP server)
+                                      ↓
+                              h2-bridge.mjs (Node HTTP/2)
+                                      ↓
+                              api2.cursor.sh gRPC
+```
+
+1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
+2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
+3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
+4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+
+## Configuration
+
+| Env var | Default | Description |
+| ------- | ------- | ----------- |
+| `PI_CURSOR_PROVIDER_DEBUG` | off | Set to any truthy value to enable JSONL debug logging |
+| `PI_CURSOR_PROVIDER_DEBUG_FILE` | auto in tmpdir | Override the debug log file path |
+| `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` | `120000` | Kill bridge if no HTTP/2 activity within this many ms of spawn |
+| `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | `300000` | Kill bridge if no HTTP/2 activity for this many ms after the first frame |
+| `PI_CURSOR_TURN_ARCHIVE_THRESHOLD` | `20` | Keep this many recent turns as raw blobs; older turns are archived as inline text |
+| `PI_CURSOR_RAW_MODELS` | off | Set to disable model deduplication and see all raw Cursor model IDs |
+
+## Changes vs upstream
+
 **This fork improves on the upstream in sixteen areas:**
 
 - **Image support** — base64 `image_url` content parts are forwarded to Cursor end-to-end; the upstream silently drops them
@@ -18,16 +73,6 @@
 - **SSE keepalive during blob-fetching** — periodic `: ping` comments keep the SSE connection alive while Cursor is fetching blobs, preventing pi's request timeout from firing before the first token arrives
 - **Conversation state preserved on transient errors** — a bridge timeout or Connect error no longer wipes the conversation state; the last good checkpoint survives so the next request resumes in-place instead of rebuilding from scratch
 - **Checkpoint saved on client disconnect** — if pi closes the connection (e.g. request timeout) after Cursor already sent a checkpoint, that checkpoint is preserved for the retry
-
-See the sections below for details.
-
-[![npm version](https://img.shields.io/npm/v/@offbynan/pi-cursor-provider.svg)](https://www.npmjs.com/package/@offbynan/pi-cursor-provider)
-
-[Pi](https://github.com/badlogic/pi-mono) extension that provides access to [Cursor](https://cursor.com) models via OAuth authentication and a local OpenAI-compatible proxy.
-
-Forked from [ndraiman/pi-cursor-provider](https://github.com/ndraiman/pi-cursor-provider).
-
-## Changes vs upstream
 
 ### Image support
 
@@ -119,19 +164,14 @@ npm run debug:timeline -- --latest
 
 The upstream `h2-bridge.mjs` used a 30-second initial connection timeout and a 120-second activity timeout. Large conversations require Cursor to deserialise a big checkpoint and complete many `getBlobArgs` round-trips before it starts streaming tokens, which regularly exceeded these limits and caused compaction to fail with a `terminated` error.
 
-This fork raises the defaults (120 s initial, 300 s activity) and makes them configurable:
-
-| Env var | Default | Purpose |
-| ------------------------------------------------ | ------- | ----------------------------------------- |
-| `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` | 120 000 | Kill bridge if no h2 activity within this many ms of spawn |
-| `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | 300 000 | Kill bridge if no h2 activity for this many ms after the first frame |
+This fork raises the defaults (120 s initial, 300 s activity) and makes them configurable via `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` and `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` (see [Configuration](#configuration)).
 
 ### Bridge termination error propagation
 
 In the upstream, if the `h2-bridge` child process exits before producing any response (e.g. due to a timeout), the proxy sends a `finish_reason: "stop"` with empty content on the streaming path, and a silent 200 OK on the non-streaming path. Pi receives what looks like a successful but empty response, then fails compaction with an opaque `terminated` error.
 
 This fork checks the bridge exit code in both paths:
-- **Streaming path** — if the bridge exits with code ≠ 0 before any response, an SSE error chunk is sent so pi surfaces a real failure.
+- **Streaming path** — if the bridge exits with code ≠ 0 before any response, an SSE error chunk is sent so pi surfaces a real failure.
 - **Non-streaming path** — same condition returns a 502 JSON error.
 - **Both paths** — the conversation state is preserved so the next retry can resume from the last good checkpoint rather than rebuilding from scratch.
 
@@ -146,11 +186,7 @@ This fork folds turns older than a configurable tail into a single `Conversation
 | 100-turn compaction | ~300 | ~61 |
 | 20-turn normal turn | ~60 | ~60 (unchanged) |
 
-The tail size (default 20) is configurable:
-
-```bash
-PI_CURSOR_TURN_ARCHIVE_THRESHOLD=30  # keep last 30 turns as raw blobs
-```
+The tail size is configurable via `PI_CURSOR_TURN_ARCHIVE_THRESHOLD` (default 20, see [Configuration](#configuration)).
 
 Archiving is conservative: old turns are only replaced if every required blob is already in the local store. If any blob is missing the turns are left as-is, so no context is silently dropped.
 
@@ -173,42 +209,6 @@ This fork removes both deletes. The last good checkpoint survives errors, so the
 When pi closes the SSE connection (e.g. its own request timeout fires), the proxy previously guarded checkpoint persistence behind `if (!cancelled)`, discarding any checkpoint that Cursor had already sent for that turn. On the next request the proxy used a stale checkpoint, losing the partial turn's context.
 
 This fork removes the `!cancelled` guard. If Cursor sent a checkpoint before the disconnect, it is saved and the retry picks it up.
-
-## How it works
-
-```
-pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
-                                      ↓
-                              proxy.ts (HTTP server)
-                                      ↓
-                              h2-bridge.mjs (Node HTTP/2)
-                                      ↓
-                              api2.cursor.sh gRPC
-```
-
-1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
-2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
-3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
-4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
-
-## Install
-
-```bash
-# Via pi install
-pi install npm:@offbynan/pi-cursor-provider
-
-# Or manually
-git clone https://github.com/offbynan/pi-cursor-provider ~/.pi/agent/extensions/cursor-provider
-cd ~/.pi/agent/extensions/cursor-provider
-npm install
-```
-
-## Usage
-
-```
-/login cursor     # authenticate via browser
-/model            # select a Cursor model
-```
 
 ## Model Mapping
 
@@ -245,19 +245,17 @@ Models sharing the same `(base, variant)` with **≥2 effort levels** and a sens
 The proxy inserts the effort before `-fast`/`-thinking`:
 
 ```
-pi selects: gpt-5.4-fast  +  effort: high  →  Cursor receives: gpt-5.4-high-fast
+pi selects: gpt-5.4-fast  +  effort: high    →  Cursor receives: gpt-5.4-high-fast
 pi selects: gpt-5.4       +  effort: medium  →  Cursor receives: gpt-5.4-medium
-pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
+pi selects: composer-2    +  (no effort)     →  Cursor receives: composer-2
 ```
-
-When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
 
 **Collapsed** when Cursor returns either:
 
 - **Multiple** effort suffixes for the same `(base, -fast, -thinking)` group, or
-- **A single** variant whose parsed effort suffix is **non-empty** (for example only `claude-4.5-opus-high` is listed). The suffix is removed from the displayed ID so Pi's reasoning-effort setting supplies it.
+- **A single** variant whose parsed effort suffix is **non-empty** (for example only `claude-4.5-opus-high` is listed). The suffix is removed from the displayed ID so pi's reasoning-effort setting supplies it.
 
-**Left as-is** (raw Cursor ID on that row, `supportsReasoningEffort: false`) when the group has **one** variant and the parsed effort suffix is **empty**—typically IDs with no effort segment, such as `composer-2`, `gemini-3.1-pro`, or `kimi-k2.5`.
+**Left as-is** when the group has **one** variant and the parsed effort suffix is **empty** — typically IDs with no effort segment, such as `composer-2`, `gemini-3.1-pro`, or `kimi-k2.5`.
 
 ### Disabling the mapping
 
@@ -269,42 +267,26 @@ PI_CURSOR_RAW_MODELS=1 pi
 
 ## Session Management
 
-The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
+The proxy maintains per-session conversation state to enable multi-turn conversations with tool call continuations and clean lifecycle handling.
 
-### How it works
+### State storage
 
-- **Session tracking** — pi's session ID is injected into requests via a `before_provider_request` hook. The proxy keys bridge state and stored conversation state from that real session ID.
-- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The proxy stores that checkpoint, plus the completed-turn count and a fingerprint of the completed structured history, and reuses it only when the incoming history still matches.
-- **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
-- **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
+- **Keyed by session ID** — pi injects its session ID into every request via a `before_provider_request` hook; the proxy uses it to key both bridge state and the stored conversation checkpoint.
+- **Checkpoint** — Cursor sends a `conversationCheckpointUpdate` message after each completed turn. The proxy stores the latest checkpoint and reuses it on the next request, so Cursor picks up exactly where it left off without rebuilding the full conversation from scratch.
+- **Blob store** — protobuf blobs referenced by the checkpoint are cached locally and served back to Cursor on demand via `getBlobArgs` / `setBlobArgs`.
+- **In-memory only** — all state lives in process memory. A proxy restart loses checkpoints; the next request rebuilds from pi's message history.
 
 ### Tool continuations
 
-When Cursor pauses for a tool call, the proxy keeps the live upstream bridge open and waits for pi to send the tool result on the next request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
+When Cursor requests a tool call, the proxy pauses the SSE stream, stores the live bridge in memory, and returns the tool call to pi. When pi sends the result on the next request, the proxy forwards it into the same in-flight Cursor run so the continuation stays part of the original turn.
 
-### Interruptions
+### Lifecycle cleanup
 
-If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint. Checkpoints are only committed after a turn finishes successfully.
+Session state is cleared on pi lifecycle events — session switch, fork, `/tree`, shutdown, and post-compaction — so stale checkpoints never carry over into a new context.
 
-### Session fork
+### Error resilience
 
-When you navigate back in pi's session tree and branch from an earlier point, the proxy discards the stored checkpoint whenever the completed history no longer matches the stored checkpoint metadata. That includes both:
-
-- completed turn count mismatches, and
-- same-depth branch changes detected via completed-history fingerprint mismatch.
-
-After discarding a stale checkpoint, the proxy reconstructs proper protobuf conversation turns from the message history pi sends, so Cursor sees the actual conversation structure at the fork point.
-
-### Session resume
-
-Conversation state is stored in memory. If the proxy restarts, checkpoints are lost. On the next request, pi sends the full conversation history, and the proxy reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
-
-That reconstruction preserves:
-
-- assistant messages
-- tool calls
-- tool results
-- final assistant text after tool results
+A bridge timeout or Connect-level error from Cursor does not wipe the stored checkpoint. The last good checkpoint survives transient failures and is used on the next retry. If Cursor sends a checkpoint before a client disconnect, that checkpoint is also preserved.
 
 ## Requirements
 
