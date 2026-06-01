@@ -1,11 +1,11 @@
 # pi-cursor-provider
 
-**This fork improves on the upstream across six areas:**
+**This fork improves on the upstream across seven areas:**
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them
-- **Reliability** — bridge timeouts hardened and configurable; errors surface as real failures instead of silent empty responses; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
+- **Compaction support** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); bridge termination errors surface as real failures instead of silent empty responses; checkpoint cleared after compaction to keep both sides in sync
+- **Reliability** — bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
 - **Model support** — per-model context window inference (vs. hardcoded 200 k); runtime cap scaling when Cursor enforces a tighter window; detailed cost table for all current families; effort-suffix variants deduplicated so pi's reasoning-level setting drives the suffix automatically
-- **Long conversations** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); checkpoint cleared on `session_compact` to keep both sides in sync
 - **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags stripped from the response and routed to `reasoning_content`
 - **Fixes & observability** — `pi -p` exit hang fixed; dead TTL eviction code removed; opt-in JSONL debug logging with a bundled timeline viewer
 
