@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-**This fork improves on the upstream across seven areas:**
+**This fork improves on the upstream across six areas:**
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them
 - **Compaction support** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); bridge termination errors surface as real failures instead of silent empty responses; checkpoint cleared after compaction to keep both sides in sync
