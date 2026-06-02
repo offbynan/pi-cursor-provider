@@ -269,6 +269,7 @@ interface ParsedMessages {
 // ── State ──
 
 const activeBridges = new Map<string, ActiveBridge>();
+const sessionBridges = new Map<string, BridgeHandle>();
 const conversationStates = new Map<string, StoredConversation>();
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
@@ -359,6 +360,7 @@ function nextDebugRequestId(): string {
 
 export const __testInternals = {
   activeBridges,
+  sessionBridges,
   conversationStates,
 };
 
@@ -518,25 +520,25 @@ function classifyBridgeFailure(code: number, stderr: StderrData): string {
   // Timeout (exit 2 or explicit reason)
   if (code === 2 || reason === "timeout") {
     return hadHeaders
-      ? "Cursor did not respond within 5 minutes \u2014 try again"
-      : "Could not reach Cursor's API within 2 minutes \u2014 check your network";
+      ? "Cursor did not respond within 5 minutes — try again"
+      : "Could not reach Cursor's API within 2 minutes — check your network";
   }
 
   // Connection or stream error (exit 1)
   if (status === 401 || status === 403) {
-    return "Cursor authentication expired \u2014 run /login cursor to re-authenticate";
+    return "Cursor authentication expired — run /login cursor to re-authenticate";
   }
   if (status === 429) {
-    return "Cursor rate limited \u2014 try again shortly";
+    return "Cursor rate limited — try again shortly";
   }
   if (status !== undefined && status >= 500 && status < 600) {
-    return `Cursor server error (${status}) \u2014 try again`;
+    return `Cursor server error (${status}) — try again`;
   }
   if (!hadHeaders) {
-    return "Could not connect to Cursor's API \u2014 check your network";
+    return "Could not connect to Cursor's API — check your network";
   }
 
-  return `Cursor bridge terminated (exit ${code}) before response \u2014 try again or shorten the conversation`;
+  return `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation`;
 }
 
 // ── Unary RPC (for model discovery) ──
@@ -825,6 +827,7 @@ export function cleanupAllSessionState(): void {
   for (const [bridgeKey, active] of activeBridges) {
     cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   }
+  sessionBridges.clear();
   conversationStates.clear();
 }
 
@@ -953,9 +956,7 @@ async function handleChatCompletion(
   }
 
   if (activeBridge && activeBridges.has(bridgeKey)) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
   let stored = conversationStates.get(convKey);
@@ -1009,11 +1010,12 @@ async function handleChatCompletion(
   };
 
   if (body.stream === false) {
-    debugLog("chat.dispatch_nonstream", { requestId, convKey });
+    debugLog("chat.dispatch_nonstream", { requestId, bridgeKey, convKey });
     await handleNonStreamingResponse(
       payload,
       accessToken,
       modelId,
+      bridgeKey,
       convKey,
       turns,
       currentTurn,
@@ -2233,7 +2235,7 @@ function createConnectFrameParser(
 }
 
 const CONTEXT_OVERFLOW_MSG =
-  "context length exceeded \u2014 Cursor rejected the request as too large";
+  "context length exceeded — Cursor rejected the request as too large";
 
 function isContextOverflowMessage(msg: string): boolean {
   return /context|token|length|overflow|too.?long|too.?large/i.test(msg);
@@ -2242,15 +2244,15 @@ function isContextOverflowMessage(msg: string): boolean {
 function mapConnectErrorCode(code: string, message: string): string {
   switch (code) {
     case "unauthenticated":
-      return "Cursor authentication expired \u2014 run /login cursor";
+      return "Cursor authentication expired — run /login cursor";
     case "resource_exhausted":
       return CONTEXT_OVERFLOW_MSG;
     case "deadline_exceeded":
-      return "Cursor request timed out server-side \u2014 try again";
+      return "Cursor request timed out server-side — try again";
     case "unavailable":
-      return "Cursor service unavailable \u2014 try again";
+      return "Cursor service unavailable — try again";
     case "internal":
-      return "Cursor internal error \u2014 try again";
+      return "Cursor internal error — try again";
     case "invalid_argument":
       return isContextOverflowMessage(message) ? CONTEXT_OVERFLOW_MSG : message;
     default:
@@ -2379,12 +2381,25 @@ function respondWithPendingToolCalls(
 
 // ── Streaming response ──
 
-function startBridge(accessToken: string, requestBytes: Uint8Array) {
+function startBridge(accessToken: string, requestBytes: Uint8Array, bridgeKey: string) {
+  let staleBridgeKilled = false;
+  const existing = sessionBridges.get(bridgeKey);
+  if (existing) {
+    if (existing.alive) {
+      console.error(
+        `[cursor-provider] Stale bridge detected for session ${bridgeKey} — force-killing and replacing`,
+      );
+      staleBridgeKilled = true;
+      try { existing.proc.kill(); } catch {}
+    }
+    sessionBridges.delete(bridgeKey);
+  }
+
   const bridge = bridgeFactory({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
   });
-  debugLog("bridge.start_run", { requestBytes });
+  debugLog("bridge.start_run", { requestBytes, bridgeKey, staleBridgeKilled });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(
     () => bridge.write(makeHeartbeatBytes()),
@@ -2392,7 +2407,8 @@ function startBridge(accessToken: string, requestBytes: Uint8Array) {
   );
   // Don't hold the event loop open between heartbeats.
   heartbeatTimer.unref();
-  return { bridge, heartbeatTimer };
+  sessionBridges.set(bridgeKey, bridge);
+  return { bridge, heartbeatTimer, staleBridgeKilled };
 }
 
 function handleStreamingResponse(
@@ -2408,9 +2424,10 @@ function handleStreamingResponse(
   requestId: string,
 ): void {
   debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
-  const { bridge, heartbeatTimer } = startBridge(
+  const { bridge, heartbeatTimer, staleBridgeKilled } = startBridge(
     accessToken,
     payload.requestBytes,
+    bridgeKey,
   );
   writeSSEStream(
     bridge,
@@ -2425,6 +2442,7 @@ function handleStreamingResponse(
     req,
     res,
     requestId,
+    staleBridgeKilled,
   );
 }
 
@@ -2451,7 +2469,9 @@ function cleanupBridge(
   if (bridge.alive) {
     sendCancelAction(bridge);
     bridge.end();
+    setTimeout(() => { try { bridge.proc.kill(); } catch {} }, 10_000);
   }
+  if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
   activeBridges.delete(bridgeKey);
 }
 
@@ -2468,6 +2488,7 @@ function writeSSEStream(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  staleBridgeKilled = false,
 ): void {
   debugLog("stream.writer_start", {
     requestId,
@@ -2485,6 +2506,17 @@ function writeSSEStream(
     "Cache-Control": "no-cache",
     Connection: "close",
   });
+  if (staleBridgeKilled) {
+    res.write(
+      `data: ${JSON.stringify({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta: { content: "\u26a0 A previous request for this session was still running and has been cancelled.\n" }, finish_reason: null }],
+      })}\n\n`,
+    );
+  }
 
   let closed = false;
   let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
@@ -2714,6 +2746,7 @@ function writeSSEStream(
       latestCheckpoint,
     });
     clearInterval(heartbeatTimer);
+    if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
     const stored = conversationStates.get(convKey);
@@ -2923,6 +2956,7 @@ async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
+  bridgeKey: string,
   convKey: string,
   completedTurns: ParsedTurn[],
   currentTurn: ParsedTurn,
@@ -2932,6 +2966,7 @@ async function handleNonStreamingResponse(
 ): Promise<void> {
   debugLog("nonstream.start", {
     requestId,
+    bridgeKey,
     convKey,
     modelId,
     currentTurn,
@@ -2943,6 +2978,7 @@ async function handleNonStreamingResponse(
   const { bridge, heartbeatTimer } = startBridge(
     accessToken,
     payload.requestBytes,
+    bridgeKey,
   );
   let cancelled = false;
 
@@ -3068,6 +3104,7 @@ async function handleNonStreamingResponse(
     bridge.onClose((code) => {
       debugLog("nonstream.bridge_close", {
         requestId,
+        bridgeKey,
         convKey,
         code,
         cancelled,
@@ -3076,6 +3113,7 @@ async function handleNonStreamingResponse(
         latestCheckpoint,
       });
       clearInterval(heartbeatTimer);
+      if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
       const stored = conversationStates.get(convKey);
@@ -3130,11 +3168,12 @@ async function handleNonStreamingResponse(
         console.error(
           `[cursor-provider] Bridge exited (code ${code}) before non-stream response (${modelId})`,
         );
+        const failureMsg = classifyBridgeFailure(code, bridge.getStderr());
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: {
-              message: classifyBridgeFailure(code, bridge.getStderr()),
+              message: failureMsg,
               type: "upstream_error",
               code: "bridge_terminated",
             },
