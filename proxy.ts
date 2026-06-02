@@ -154,6 +154,11 @@ interface PendingExec {
   decodedArgs: string;
 }
 
+interface StderrData {
+  responseHeaders?: { status: number; grpcStatus: number | null };
+  exitReason?: "timeout" | "connection_error" | "stream_error";
+}
+
 interface BridgeHandle {
   proc: Pick<ChildProcess, "kill">;
   readonly alive: boolean;
@@ -162,6 +167,7 @@ interface BridgeHandle {
   unref(): void;
   onData(cb: (chunk: Buffer) => void): void;
   onClose(cb: (code: number) => void): void;
+  getStderr(): StderrData;
 }
 
 export type BridgeFactory = (options: SpawnBridgeOptions) => BridgeHandle;
@@ -395,7 +401,33 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     unary: options.unary ?? false,
   });
   const proc = spawn("node", [BRIDGE_PATH], {
-    stdio: ["pipe", "pipe", "ignore"],
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const stderrData: StderrData = {};
+  let stderrBuf = "";
+  proc.stderr!.on("data", (chunk: Buffer) => {
+    stderrBuf += chunk.toString("utf8");
+    let nl: number;
+    while ((nl = stderrBuf.indexOf("\n")) !== -1) {
+      const line = stderrBuf.slice(0, nl).trim();
+      stderrBuf = stderrBuf.slice(nl + 1);
+      if (!line) continue;
+      debugLog("bridge.stderr", { rpcPath: options.rpcPath, line });
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (parsed["type"] === "response_headers") {
+          stderrData.responseHeaders = {
+            status: parsed["status"] as number,
+            grpcStatus: parsed["grpcStatus"] as number | null,
+          };
+        } else if (parsed["type"] === "exit_reason") {
+          stderrData.exitReason = parsed["reason"] as StderrData["exitReason"];
+        }
+      } catch {
+        // not structured JSON — ignore
+      }
+    }
   });
 
   const config = JSON.stringify({
@@ -433,6 +465,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     // loop alive after the bridge exits (critical for `pi -p` to exit cleanly).
     try { proc.stdout!.destroy(); } catch {}
     try { proc.stdin!.destroy(); } catch {}
+    try { proc.stderr!.destroy(); } catch {}
     debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
     cbs.close?.(exitCode);
   });
@@ -469,7 +502,41 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
         cbs.close = cb;
       }
     },
+    getStderr() {
+      return stderrData;
+    },
   };
+}
+
+// ── Bridge failure classification ──
+
+function classifyBridgeFailure(code: number, stderr: StderrData): string {
+  const hadHeaders = !!stderr.responseHeaders;
+  const status = stderr.responseHeaders?.status;
+  const reason = stderr.exitReason;
+
+  // Timeout (exit 2 or explicit reason)
+  if (code === 2 || reason === "timeout") {
+    return hadHeaders
+      ? "Cursor did not respond within 5 minutes \u2014 try again"
+      : "Could not reach Cursor's API within 2 minutes \u2014 check your network";
+  }
+
+  // Connection or stream error (exit 1)
+  if (status === 401 || status === 403) {
+    return "Cursor authentication expired \u2014 run /login cursor to re-authenticate";
+  }
+  if (status === 429) {
+    return "Cursor rate limited \u2014 try again shortly";
+  }
+  if (status !== undefined && status >= 500 && status < 600) {
+    return `Cursor server error (${status}) \u2014 try again`;
+  }
+  if (!hadHeaders) {
+    return "Could not connect to Cursor's API \u2014 check your network";
+  }
+
+  return `Cursor bridge terminated (exit ${code}) before response \u2014 try again or shorten the conversation`;
 }
 
 // ── Unary RPC (for model discovery) ──
@@ -2165,15 +2232,42 @@ function createConnectFrameParser(
   };
 }
 
+const CONTEXT_OVERFLOW_MSG =
+  "context length exceeded \u2014 Cursor rejected the request as too large";
+
+function isContextOverflowMessage(msg: string): boolean {
+  return /context|token|length|overflow|too.?long|too.?large/i.test(msg);
+}
+
+function mapConnectErrorCode(code: string, message: string): string {
+  switch (code) {
+    case "unauthenticated":
+      return "Cursor authentication expired \u2014 run /login cursor";
+    case "resource_exhausted":
+      return CONTEXT_OVERFLOW_MSG;
+    case "deadline_exceeded":
+      return "Cursor request timed out server-side \u2014 try again";
+    case "unavailable":
+      return "Cursor service unavailable \u2014 try again";
+    case "internal":
+      return "Cursor internal error \u2014 try again";
+    case "invalid_argument":
+      return isContextOverflowMessage(message) ? CONTEXT_OVERFLOW_MSG : message;
+    default:
+      return message;
+  }
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
   if (data.length === 0) return null;
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
-    if (error)
-      return new Error(
-        `Connect error ${error.code ?? "unknown"}: ${error.message ?? "Unknown error"}`,
-      );
+    if (error) {
+      const code = String(error.code ?? "unknown");
+      const rawMessage = String(error.message ?? "Unknown error");
+      return new Error(mapConnectErrorCode(code, rawMessage));
+    }
     return null;
   } catch {
     return null;
@@ -2643,7 +2737,8 @@ function writeSSEStream(
         console.error(
           `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
         );
-        sendSSE(makeChunk({ content: `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation` }, "error"));
+        const failureMsg = classifyBridgeFailure(code, bridge.getStderr());
+        sendSSE(makeChunk({ content: failureMsg }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
         closeResponse();
@@ -3039,7 +3134,7 @@ async function handleNonStreamingResponse(
         res.end(
           JSON.stringify({
             error: {
-              message: `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation`,
+              message: classifyBridgeFailure(code, bridge.getStderr()),
               type: "upstream_error",
               code: "bridge_terminated",
             },

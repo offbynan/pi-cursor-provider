@@ -1347,6 +1347,10 @@ class FakeBridge {
     this.closeCb = cb;
   }
 
+  getStderr() {
+    return {};
+  }
+
   emitServerMessage(message: any) {
     const payload = toBinary(AgentServerMessageSchema, message);
     this.emitChunk(frameConnectMessageForTest(payload));

@@ -105,12 +105,14 @@ function resetTimeout() {
 
 function killBridge() {
   clearTimeout(timeout);
+  process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "timeout" }) + "\n");
   client.destroy();
-  process.exit(1);
+  process.exit(2);
 }
 
 client.on("error", () => {
   clearTimeout(timeout);
+  process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "connection_error" }) + "\n");
   process.exit(1);
 });
 
@@ -130,6 +132,20 @@ if (!unary) {
 }
 const h2Stream = client.request(headers);
 
+// Read response headers: switch to activity timeout and forward status to stderr
+h2Stream.on("response", (headers) => {
+  resetTimeout();
+  const status = headers[":status"] ?? null;
+  const grpcStatus = headers["grpc-status"] ?? null;
+  process.stderr.write(
+    JSON.stringify({
+      type: "response_headers",
+      status: status !== null ? Number(status) : null,
+      grpcStatus: grpcStatus !== null ? Number(grpcStatus) : null,
+    }) + "\n",
+  );
+});
+
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
   resetTimeout();
@@ -145,6 +161,7 @@ h2Stream.on("end", () => {
 
 h2Stream.on("error", () => {
   clearTimeout(timeout);
+  process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "stream_error" }) + "\n");
   client.close();
   process.exit(1);
 });
