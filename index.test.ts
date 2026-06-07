@@ -700,7 +700,7 @@ describe("session cleanup", () => {
       blobStore: new Map(),
       mcpTools: [],
       pendingExecs: [],
-      currentTurn: turn("current"),
+      lastTotalTokens: 0, currentTurn: turn("current"),
     });
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv",
@@ -769,7 +769,7 @@ describe("session cleanup hook wiring", () => {
       blobStore: new Map(),
       mcpTools: [],
       pendingExecs: [],
-      currentTurn: turn("current"),
+      lastTotalTokens: 0, currentTurn: turn("current"),
     });
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv",
@@ -801,7 +801,7 @@ describe("session cleanup hook wiring", () => {
         blobStore: new Map(),
         mcpTools: [],
         pendingExecs: [],
-        currentTurn: turn("current"),
+        lastTotalTokens: 0, currentTurn: turn("current"),
       });
       __testInternals.conversationStates.set(convKey, {
         conversationId: "conv",
@@ -1610,7 +1610,7 @@ describe("proxy integration — session handling", () => {
           decodedArgs: '{"path":"README.md"}',
         },
       ],
-      currentTurn: turn("review it", [
+      lastTotalTokens: 0, currentTurn: turn("review it", [
         assistantStep("starting review"),
         toolStep("tc1", "read", { path: "package.json" }),
         assistantStep("continuing review"),

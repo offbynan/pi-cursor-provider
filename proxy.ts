@@ -2331,6 +2331,23 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+function computeUsageFromStored(
+  lastTotalTokens: number,
+  convKey: string,
+  modelId: string,
+): { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined {
+  const totalTokens = lastTotalTokens || conversationStates.get(convKey)?.lastTotalTokens || 0;
+  if (totalTokens === 0) return undefined;
+  const stored = conversationStates.get(convKey);
+  const cursorWindow = stored?.effectiveContextWindow ?? 0;
+  const piWindow = inferContextWindow(modelId);
+  let total_tokens = totalTokens;
+  if (cursorWindow > 0 && piWindow > cursorWindow) {
+    total_tokens = Math.round(totalTokens * piWindow / cursorWindow);
+  }
+  return { prompt_tokens: total_tokens, completion_tokens: 0, total_tokens };
+}
+
 function respondWithPendingToolCalls(
   modelId: string,
   pendingExecs: PendingExec[],
@@ -3058,6 +3075,7 @@ function handleToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      lastTotalTokens: active.lastTotalTokens,
     });
     debugLog("tool_resume.partial_wait", {
       requestId,
@@ -3065,7 +3083,7 @@ function handleToolResultResume(
       unresolvedExecs,
       currentTurn,
     });
-    respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res);
+    respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res, computeUsageFromStored(active.lastTotalTokens, convKey, modelId));
     return;
   }
 
