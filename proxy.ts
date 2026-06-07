@@ -179,6 +179,7 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
+  lastTotalTokens: number;
 }
 
 export interface StoredConversation {
@@ -191,6 +192,15 @@ export interface StoredConversation {
    * our static inferContextWindow() estimate when Cursor enforces a tighter cap.
    */
   effectiveContextWindow?: number;
+  /**
+   * Last known usedTokens from Cursor's ConversationTokenDetails.  Persisted
+   * so that tool-call continuations (which create a fresh StreamState) can
+   * report meaningful usage even if the checkpoint hasn't arrived yet in the
+   * new stream segment.
+   */
+  lastTotalTokens?: number;
+  /** Cached for transparent retry when a bridge dies mid-request. */
+  systemPrompt?: string;
 }
 
 interface StreamState {
@@ -948,6 +958,7 @@ async function handleChatCompletion(
         res,
         body.stream !== false,
         requestId,
+        accessToken,
       );
       return;
     }
@@ -969,6 +980,8 @@ async function handleChatCompletion(
     };
     conversationStates.set(convKey, stored);
   }
+
+  stored.systemPrompt = systemPrompt;
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
@@ -2260,7 +2273,14 @@ function mapConnectErrorCode(code: string, message: string): string {
   }
 }
 
-function parseConnectEndStream(data: Uint8Array): Error | null {
+interface ConnectEndStreamError {
+  message: string;
+  retryable: boolean;
+}
+
+const RETRYABLE_CONNECT_CODES = new Set(["internal", "unavailable", "deadline_exceeded"]);
+
+function parseConnectEndStream(data: Uint8Array): ConnectEndStreamError | null {
   if (data.length === 0) return null;
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -2268,7 +2288,10 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
     if (error) {
       const code = String(error.code ?? "unknown");
       const rawMessage = String(error.message ?? "Unknown error");
-      return new Error(mapConnectErrorCode(code, rawMessage));
+      return {
+        message: mapConnectErrorCode(code, rawMessage),
+        retryable: RETRYABLE_CONNECT_CODES.has(code),
+      };
     }
     return null;
   } catch {
@@ -2313,6 +2336,7 @@ function respondWithPendingToolCalls(
   pendingExecs: PendingExec[],
   stream: boolean,
   res: ServerResponse,
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
 ): void {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -2346,6 +2370,18 @@ function respondWithPendingToolCalls(
         })}\n\n`,
       );
     }
+    if (usage) {
+      res.write(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelId,
+          choices: [],
+          usage,
+        })}\n\n`,
+      );
+    }
     res.write(
       `data: ${JSON.stringify({
         id: completionId,
@@ -2374,7 +2410,7 @@ function respondWithPendingToolCalls(
           finish_reason: "tool_calls",
         },
       ],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     }),
   );
 }
@@ -2443,6 +2479,7 @@ function handleStreamingResponse(
     res,
     requestId,
     staleBridgeKilled,
+    accessToken,
   );
 }
 
@@ -2475,9 +2512,12 @@ function cleanupBridge(
   activeBridges.delete(bridgeKey);
 }
 
+const MAX_BRIDGE_RETRIES =
+  parseInt(process.env.PI_CURSOR_MAX_BRIDGE_RETRIES ?? "") || 2;
+
 function writeSSEStream(
-  bridge: BridgeHandle,
-  heartbeatTimer: ReturnType<typeof setInterval>,
+  initialBridge: BridgeHandle,
+  initialHeartbeatTimer: ReturnType<typeof setInterval>,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
   modelId: string,
@@ -2489,6 +2529,7 @@ function writeSSEStream(
   res: ServerResponse,
   requestId?: string,
   staleBridgeKilled = false,
+  accessToken?: string,
 ): void {
   debugLog("stream.writer_start", {
     requestId,
@@ -2500,6 +2541,19 @@ function writeSSEStream(
   });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+
+  // Mutable bridge references — updated on retry.
+  let activeBridge = initialBridge;
+  let activeHeartbeatTimer = initialHeartbeatTimer;
+  let retryCount = 0;
+  let retryableConnectError = false;
+
+  // Snapshot the checkpoint before this turn so retries replay cleanly
+  // without risking a mid-turn checkpoint that includes partial progress.
+  const preTurnCheckpoint = (() => {
+    const s = conversationStates.get(convKey);
+    return s?.checkpoint ? new Uint8Array(s.checkpoint) : null;
+  })();
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -2532,6 +2586,7 @@ function writeSSEStream(
     if (closed) return;
     closed = true;
     clearInterval(keepAliveTimer);
+    if (stallTimer) clearTimeout(stallTimer);
     res.end();
   };
 
@@ -2564,11 +2619,10 @@ function writeSSEStream(
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
-    totalTokens: 0,
+    totalTokens: storedForState?.lastTotalTokens ?? 0,
     cursorContextWindow: storedForState?.effectiveContextWindow ?? 0,
     inferredContextWindow: inferContextWindow(modelId),
   };
-  const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
   let latestCheckpoint: Uint8Array | null = null;
@@ -2580,227 +2634,341 @@ function writeSSEStream(
   }, 15_000);
   keepAliveTimer.unref();
 
+  // Stall detector: kill the bridge if no data arrives from Cursor for too
+  // long.  This catches cases where the H2 connection is technically alive
+  // but Cursor's server is stuck processing a stale conversation checkpoint.
+  // Reset on every incoming Connect frame.
+  const STALL_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS ?? "") || 120_000;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const resetStallTimer = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if (cancelled || closed) return;
+      debugLog("stream.stall_timeout", { requestId, bridgeKey, convKey, modelId });
+      console.error(
+        `[cursor-provider] Bridge stalled for ${STALL_TIMEOUT_MS / 1000}s \u2014 killing (${modelId})`,
+      );
+      cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
+    }, STALL_TIMEOUT_MS);
+    stallTimer.unref?.();
+  };
+
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
     if (cancelled || closed) return;
     debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
-    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
     closeResponse();
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
 
-  const processChunk = createConnectFrameParser(
-    (messageBytes) => {
-      try {
-        const serverMessage = fromBinary(
-          AgentServerMessageSchema,
-          messageBytes,
-        );
-        processServerMessage(
-          serverMessage,
-          blobStore,
-          mcpTools,
-          (data) => bridge.write(data),
-          state,
-          (text, isThinking) => {
-            if (isThinking) {
-              sendSSE(makeChunk({ reasoning_content: text }));
-            } else {
-              const { content, reasoning } = tagFilter.process(text);
-              if (reasoning)
-                sendSSE(makeChunk({ reasoning_content: reasoning }));
-              if (content) {
-                appendAssistantTextToTurn(currentTurn, content);
-                sendSSE(makeChunk({ content }));
+  // Wire data/close handlers onto the current activeBridge.  Called once on
+  // initial setup and again on each transparent retry.
+  function attachToBridge(): void {
+    // Each attempt gets a fresh thinking-tag filter so retried output doesn't
+    // inherit stale parser state from the dead bridge.
+    const tagFilter = createThinkingTagFilter();
+    let contentSent = false;
+    mcpExecReceived = false;
+    resetStallTimer();
+
+    const processChunk = createConnectFrameParser(
+      (messageBytes) => {
+        resetStallTimer();
+        try {
+          const serverMessage = fromBinary(
+            AgentServerMessageSchema,
+            messageBytes,
+          );
+          processServerMessage(
+            serverMessage,
+            blobStore,
+            mcpTools,
+            (data) => activeBridge.write(data),
+            state,
+            (text, isThinking) => {
+              if (isThinking) {
+                contentSent = true;
+                sendSSE(makeChunk({ reasoning_content: text }));
+              } else {
+                const { content, reasoning } = tagFilter.process(text);
+                if (reasoning) {
+                  contentSent = true;
+                  sendSSE(makeChunk({ reasoning_content: reasoning }));
+                }
+                if (content) {
+                  contentSent = true;
+                  appendAssistantTextToTurn(currentTurn, content);
+                  sendSSE(makeChunk({ content }));
+                }
               }
-            }
-          },
-          (exec) => {
-            state.pendingExecs.push(exec);
-            mcpExecReceived = true;
+            },
+            (exec) => {
+              state.pendingExecs.push(exec);
+              mcpExecReceived = true;
 
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning)
-              sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) {
-              appendAssistantTextToTurn(currentTurn, flushed.content);
-              sendSSE(makeChunk({ content: flushed.content }));
-            }
+              const flushed = tagFilter.flush();
+              if (flushed.reasoning)
+                sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+              if (flushed.content) {
+                appendAssistantTextToTurn(currentTurn, flushed.content);
+                sendSSE(makeChunk({ content: flushed.content }));
+              }
 
-            currentTurn.steps.push({
-              kind: "toolCall",
-              toolCallId: exec.toolCallId,
-              toolName: exec.toolName,
-              arguments: parseToolCallArguments(exec.decodedArgs),
-            });
+              currentTurn.steps.push({
+                kind: "toolCall",
+                toolCallId: exec.toolCallId,
+                toolName: exec.toolName,
+                arguments: parseToolCallArguments(exec.decodedArgs),
+              });
 
-            const toolCallIndex = state.toolCallIndex++;
-            sendSSE(
-              makeChunk({
-                tool_calls: [
-                  {
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
+              const toolCallIndex = state.toolCallIndex++;
+              sendSSE(
+                makeChunk({
+                  tool_calls: [
+                    {
+                      index: toolCallIndex,
+                      id: exec.toolCallId,
+                      type: "function",
+                      function: {
+                        name: exec.toolName,
+                        arguments: exec.decodedArgs,
+                      },
                     },
-                  },
-                ],
-              }),
-            );
+                  ],
+                }),
+              );
 
-            activeBridges.set(bridgeKey, {
-              bridge,
-              heartbeatTimer,
-              blobStore,
-              mcpTools,
-              pendingExecs: state.pendingExecs,
-              currentTurn,
-            });
-            debugLog("stream.tool_call_pause", {
-              requestId,
-              bridgeKey,
-              exec,
-              pendingExecs: state.pendingExecs,
-              currentTurn,
-            });
+              activeBridges.set(bridgeKey, {
+                bridge: activeBridge,
+                heartbeatTimer: activeHeartbeatTimer,
+                blobStore,
+                mcpTools,
+                pendingExecs: state.pendingExecs,
+                currentTurn,
+                lastTotalTokens: state.totalTokens,
+              });
+              debugLog("stream.tool_call_pause", {
+                requestId,
+                bridgeKey,
+                exec,
+                pendingExecs: state.pendingExecs,
+                currentTurn,
+              });
 
-            sendSSE(makeChunk({}, "tool_calls"));
-            sendDone();
-            closeResponse();
-          },
-          (checkpointBytes) => {
-            latestCheckpoint = checkpointBytes;
-            const stored = conversationStates.get(convKey);
-            if (stored) {
-              stored.checkpoint = checkpointBytes;
-              for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-              if (state.cursorContextWindow > 0) {
-                stored.effectiveContextWindow = state.cursorContextWindow;
+              sendSSE(makeUsageChunk());
+              sendSSE(makeChunk({}, "tool_calls"));
+              sendDone();
+              closeResponse();
+            },
+            (checkpointBytes) => {
+              latestCheckpoint = checkpointBytes;
+              const stored = conversationStates.get(convKey);
+              if (stored) {
+                stored.checkpoint = checkpointBytes;
+                for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+                if (state.cursorContextWindow > 0) {
+                  stored.effectiveContextWindow = state.cursorContextWindow;
+                }
+                if (state.totalTokens > 0) {
+                  stored.lastTotalTokens = state.totalTokens;
+                }
               }
-            }
-            debugLog("stream.checkpoint_buffered", {
-              requestId,
-              convKey,
-              checkpointBytes,
+              debugLog("stream.checkpoint_buffered", {
+                requestId,
+                convKey,
+                checkpointBytes,
+              });
+            },
+          );
+        } catch (err) {
+          console.error(
+            "[cursor-provider] Stream message processing error:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      },
+      (endStreamBytes) => {
+        resetStallTimer();
+        const endError = parseConnectEndStream(endStreamBytes);
+        clearInterval(activeHeartbeatTimer);
+        if (stallTimer) clearTimeout(stallTimer);
+        if (endError) {
+          if (endError.retryable && !contentSent && !closed && accessToken && retryCount < MAX_BRIDGE_RETRIES) {
+            debugLog("stream.retryable_connect_error", {
+              requestId, bridgeKey, convKey, modelId,
+              message: endError.message, attempt: retryCount + 1,
             });
-          },
-        );
-      } catch (err) {
-        console.error(
-          "[cursor-provider] Stream message processing error:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-    },
-    (endStreamBytes) => {
-      const endError = parseConnectEndStream(endStreamBytes);
-      // Always stop heartbeats and unref the bridge regardless of error/success
-      // so the parent process is not kept alive waiting for HTTP/2 END_STREAM.
-      clearInterval(heartbeatTimer);
-      bridge.end();
-      bridge.unref();
-      if (endError) {
-        console.error(
-          `[cursor-provider] Cursor stream error (${modelId}):`,
-          endError.message,
-        );
-        sendSSE(makeChunk({ content: endError.message }, "error"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeResponse();
-      } else {
-        // Cursor's Connect-level response is complete. Send the SSE response
-        // immediately without waiting for HTTP/2 END_STREAM, which Cursor can
-        // delay by several seconds after the Connect end-stream frame.
-        const flushed = tagFilter.flush();
-        if (flushed.reasoning)
-          sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-        if (flushed.content) {
-          appendAssistantTextToTurn(currentTurn, flushed.content);
-          sendSSE(makeChunk({ content: flushed.content }));
+            console.error(
+              `[cursor-provider] Retryable Cursor error (${modelId}): ${endError.message} — will retry (${retryCount + 1}/${MAX_BRIDGE_RETRIES})`,
+            );
+            retryableConnectError = true;
+            try { activeBridge.proc.kill(); } catch {}
+            return;
+          }
+          console.error(
+            `[cursor-provider] Cursor stream error (${modelId}):`,
+            endError.message,
+          );
+          activeBridge.end();
+          activeBridge.unref();
+          sendSSE(makeChunk({ content: endError.message }, "error"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeResponse();
+        } else {
+          activeBridge.end();
+          activeBridge.unref();
+          const flushed = tagFilter.flush();
+          if (flushed.reasoning)
+            sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+          if (flushed.content) {
+            appendAssistantTextToTurn(currentTurn, flushed.content);
+            sendSSE(makeChunk({ content: flushed.content }));
+          }
+          sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeResponse();
         }
-        sendSSE(makeChunk({}, "stop"));
+      },
+    );
+
+    activeBridge.onData(processChunk);
+
+    activeBridge.onClose((code) => {
+      debugLog("stream.bridge_close", {
+        requestId,
+        bridgeKey,
+        convKey,
+        code,
+        cancelled,
+        mcpExecReceived,
+        currentTurn,
+        latestCheckpoint,
+        retryCount,
+      });
+      clearInterval(activeHeartbeatTimer);
+      if (stallTimer) clearTimeout(stallTimer);
+      if (sessionBridges.get(bridgeKey) === activeBridge) sessionBridges.delete(bridgeKey);
+      const stored = conversationStates.get(convKey);
+      if (stored) {
+        for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+        if (latestCheckpoint) {
+          stored.checkpoint = latestCheckpoint;
+          debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
+        }
+        if (state.cursorContextWindow > 0) {
+          stored.effectiveContextWindow = state.cursorContextWindow;
+        }
+        if (state.totalTokens > 0) {
+          stored.lastTotalTokens = state.totalTokens;
+        }
+      }
+      if (cancelled) return;
+
+      // ── Transparent retry on bridge failure ──
+      // When the bridge dies mid-request (connection killed by LB, TCP
+      // timeout, etc.) or Cursor returns a retryable protocol error
+      // (internal, unavailable, deadline_exceeded), rebuild the Cursor
+      // request and replay on a fresh bridge.  The SSE response stays
+      // open — the client sees at most a brief pause.
+      const shouldRetry = retryableConnectError || code !== 0;
+      if (shouldRetry && !closed && accessToken && retryCount < MAX_BRIDGE_RETRIES) {
+        const cp = preTurnCheckpoint ?? stored?.checkpoint ?? null;
+        // For retryable Connect errors, allow retry even without a
+        // checkpoint (first request in session) — buildCursorRequest
+        // handles checkpoint=null by rebuilding from turns.
+        if (stored && (cp || retryableConnectError)) {
+          retryCount++;
+          const wasConnectError = retryableConnectError;
+          retryableConnectError = false;
+          debugLog("stream.retry", {
+            requestId,
+            bridgeKey,
+            convKey,
+            attempt: retryCount,
+            maxRetries: MAX_BRIDGE_RETRIES,
+            connectError: wasConnectError,
+          });
+          console.error(
+            `[cursor-provider] ${wasConnectError ? "Retryable Cursor error" : `Bridge died (exit ${code})`}, retry ${retryCount}/${MAX_BRIDGE_RETRIES} (${modelId})`,
+          );
+
+          // Reset per-attempt stream state; keep cumulative token counts.
+          state.pendingExecs = [];
+          latestCheckpoint = null;
+
+          const retryPayload = buildCursorRequest(
+            modelId,
+            stored.systemPrompt || "You are a helpful assistant.",
+            currentTurn.userText,
+            completedTurns,
+            stored.conversationId,
+            cp,
+            blobStore,
+            currentTurn.images,
+          );
+          retryPayload.mcpTools = mcpTools;
+
+          const { bridge: newBridge, heartbeatTimer: newTimer } = startBridge(
+            accessToken,
+            retryPayload.requestBytes,
+            bridgeKey,
+          );
+          activeBridge = newBridge;
+          activeHeartbeatTimer = newTimer;
+
+          // Re-register client-close listener with new bridge refs (the old
+          // listener already uses the mutable activeBridge/activeHeartbeatTimer).
+          attachToBridge();
+          return;
+        }
+      }
+
+      // No retry — remove client-close listeners since this bridge is done.
+      req.removeListener("close", onClientClose);
+      res.removeListener("close", onClientClose);
+
+      if (!mcpExecReceived) {
+        if (code !== 0) {
+          console.error(
+            `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
+          );
+          const failureMsg = classifyBridgeFailure(code, activeBridge.getStderr());
+          sendSSE(makeChunk({ content: failureMsg }, "error"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeResponse();
+        } else {
+          const flushed = tagFilter.flush();
+          if (flushed.reasoning)
+            sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+          if (flushed.content) {
+            appendAssistantTextToTurn(currentTurn, flushed.content);
+            sendSSE(makeChunk({ content: flushed.content }));
+          }
+          sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeResponse();
+        }
+      } else if (code !== 0) {
+        sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
         closeResponse();
+        activeBridges.delete(bridgeKey);
+      } else {
+        activeBridges.delete(bridgeKey);
+        closeResponse();
       }
-    },
-  );
-
-  bridge.onData(processChunk);
-
-  bridge.onClose((code) => {
-    debugLog("stream.bridge_close", {
-      requestId,
-      bridgeKey,
-      convKey,
-      code,
-      cancelled,
-      mcpExecReceived,
-      currentTurn,
-      latestCheckpoint,
     });
-    clearInterval(heartbeatTimer);
-    if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
-    req.removeListener("close", onClientClose);
-    res.removeListener("close", onClientClose);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      if (latestCheckpoint) {
-        stored.checkpoint = latestCheckpoint;
-        debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
-      }
-      if (state.cursorContextWindow > 0) {
-        stored.effectiveContextWindow = state.cursorContextWindow;
-      }
-    }
-    if (cancelled) return;
-    if (!mcpExecReceived) {
-      if (code !== 0) {
-        // Bridge was killed before receiving any response (e.g. timeout waiting
-        // for Cursor to process a large checkpoint during compaction). Treat as
-        // an error so callers (like pi compaction) see a real failure instead of
-        // an empty successful-looking response.
-        console.error(
-          `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
-        );
-        const failureMsg = classifyBridgeFailure(code, bridge.getStderr());
-        sendSSE(makeChunk({ content: failureMsg }, "error"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeResponse();
-      } else {
-        const flushed = tagFilter.flush();
-        if (flushed.reasoning)
-          sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-        if (flushed.content) {
-          appendAssistantTextToTurn(currentTurn, flushed.content);
-          sendSSE(makeChunk({ content: flushed.content }));
-        }
-        sendSSE(makeChunk({}, "stop"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeResponse();
-      }
-    } else if (code !== 0) {
-      sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
-      sendSSE(makeUsageChunk());
-      sendDone();
-      closeResponse();
-      activeBridges.delete(bridgeKey);
-    } else {
-      // Bridge closed cleanly after a tool call pause. The HTTP response was
-      // already ended by the MCP exec handler; just ensure cleanup.
-      activeBridges.delete(bridgeKey);
-      closeResponse();
-    }
-  });
+  }
+
+  attachToBridge();
 }
 
 export function writeSSEStreamForTests(args: {
@@ -2816,6 +2984,7 @@ export function writeSSEStreamForTests(args: {
   req: IncomingMessage;
   res: ServerResponse;
   requestId?: string;
+  accessToken?: string;
 }): void {
   writeSSEStream(
     args.bridge,
@@ -2830,6 +2999,8 @@ export function writeSSEStreamForTests(args: {
     args.req,
     args.res,
     args.requestId,
+    false,
+    args.accessToken,
   );
 }
 
@@ -2846,6 +3017,7 @@ function handleToolResultResume(
   res: ServerResponse,
   stream: boolean,
   requestId?: string,
+  accessToken?: string,
 ): void {
   const {
     bridge,
@@ -2947,6 +3119,8 @@ function handleToolResultResume(
     req,
     res,
     requestId,
+    false,
+    accessToken,
   );
 }
 
@@ -2999,13 +3173,13 @@ async function handleNonStreamingResponse(
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
-    totalTokens: 0,
+    totalTokens: storedForNonStream?.lastTotalTokens ?? 0,
     cursorContextWindow: storedForNonStream?.effectiveContextWindow ?? 0,
     inferredContextWindow: inferContextWindow(modelId),
   };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
-  let nonStreamError: Error | null = null;
+  let nonStreamError: ConnectEndStreamError | null = null;
   let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
@@ -3129,6 +3303,9 @@ async function handleNonStreamingResponse(
         }
         if (state.cursorContextWindow > 0) {
           stored.effectiveContextWindow = state.cursorContextWindow;
+        }
+        if (state.totalTokens > 0) {
+          stored.lastTotalTokens = state.totalTokens;
         }
       }
 

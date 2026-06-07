@@ -87,15 +87,19 @@ if (!configBuf) process.exit(1);
 const config = JSON.parse(configBuf.toString("utf8"));
 const { accessToken, url, path: rpcPath, unary } = config;
 
-const client = http2.connect(url || "https://api2.cursor.sh");
-
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
-// Initial timeout is generous because large conversations require Cursor to
-// deserialize a big checkpoint + run many getBlobArgs round-trips before it
-// starts streaming tokens — 30 s was too short and caused compaction failures.
 const INITIAL_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS ?? "") || 120_000;
 const ACTIVITY_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS ?? "") || 300_000;
+const H2_PING_INTERVAL_MS = parseInt(process.env.PI_CURSOR_BRIDGE_PING_INTERVAL_MS ?? "") || 15_000;
+const H2_PING_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_PING_TIMEOUT_MS ?? "") || 10_000;
+
+const client = http2.connect(url || "https://api2.cursor.sh", {
+  // Detect dead TCP connections at the HTTP/2 level — without this, a silently
+  // dropped connection (NAT timeout, LB cycling) can leave the bridge waiting
+  // for up to ACTIVITY_TIMEOUT_MS (5 min) with no indication of failure.
+  pingInterval: H2_PING_INTERVAL_MS,
+  pingTimeout: H2_PING_TIMEOUT_MS,
+});
+
 let timeout = setTimeout(killBridge, INITIAL_TIMEOUT_MS);
 
 function resetTimeout() {
