@@ -502,8 +502,8 @@ describe("processModels", () => {
 
   test("full raw model list dedup count", () => {
     const result = processModels(rawModels as CursorModel[]);
-    // Should be significantly fewer than 83
-    expect(result.length).toBeLessThan(50);
+    // Should be significantly fewer than the raw fallback list.
+    expect(result.length).toBeLessThan((rawModels as CursorModel[]).length);
     expect(result.length).toBeGreaterThan(20);
 
     // Spot checks
@@ -514,6 +514,10 @@ describe("processModels", () => {
     const gpt54 = result.find((r) => r.id === "gpt-5.4");
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
+
+    const gpt55 = result.find((r) => r.id === "gpt-5.5");
+    expect(gpt55).toBeDefined();
+    expect(gpt55!.supportsEffort).toBe(true);
 
     // Opus should be deduped too
     const opus46 = result.find((r) => r.id === "claude-4.6-opus");

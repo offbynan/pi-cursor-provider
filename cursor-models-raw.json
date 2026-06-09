@@ -28,6 +28,20 @@
     "maxTokens": 64000
   },
   {
+    "id": "claude-4.5-haiku",
+    "name": "Haiku 4.5",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.5-haiku-thinking",
+    "name": "Haiku 4.5 Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "claude-4.5-opus-high",
     "name": "Opus 4.5",
     "reasoning": false,
@@ -51,6 +65,20 @@
   {
     "id": "claude-4.5-sonnet-thinking",
     "name": "Sonnet 4.5 1M Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.6-opus-fast",
+    "name": "Opus 4.6 Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.6-opus-fast-thinking",
+    "name": "Opus 4.6 Fast Thinking",
     "reasoning": false,
     "contextWindow": 200000,
     "maxTokens": 64000
@@ -98,6 +126,55 @@
     "maxTokens": 64000
   },
   {
+    "id": "claude-4.7-opus-fast",
+    "name": "Opus 4.7 Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.7-opus-fast-thinking",
+    "name": "Opus 4.7 Fast Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.7-opus-high",
+    "name": "Opus 4.7",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.7-opus-high-thinking",
+    "name": "Opus 4.7 Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.8-opus-high",
+    "name": "Opus 4.8",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "claude-4.8-opus-high-thinking",
+    "name": "Opus 4.8 Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "composer-1",
+    "name": "Composer 1",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "composer-1.5",
     "name": "Composer 1.5",
     "reasoning": false,
@@ -140,8 +217,29 @@
     "maxTokens": 64000
   },
   {
+    "id": "gemini-2.5-flash",
+    "name": "Gemini 2.5 Flash",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "gemini-3-flash",
     "name": "Gemini 3 Flash",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gemini-3-pro",
+    "name": "Gemini 3 Pro",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gemini-3-pro-image-preview",
+    "name": "Gemini 3 Pro Image Preview",
     "reasoning": false,
     "contextWindow": 200000,
     "maxTokens": 64000
@@ -154,6 +252,62 @@
     "maxTokens": 64000
   },
   {
+    "id": "gemini-3.5-flash",
+    "name": "Gemini 3.5 Flash",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-codex",
+    "name": "GPT-5 Codex",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-high",
+    "name": "GPT-5 High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-high-fast",
+    "name": "GPT-5 High Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-low",
+    "name": "GPT-5 Low",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-low-fast",
+    "name": "GPT-5 Low Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-medium",
+    "name": "GPT-5",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-medium-fast",
+    "name": "GPT-5 Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "gpt-5-mini",
     "name": "GPT-5 Mini",
     "reasoning": false,
@@ -161,8 +315,29 @@
     "maxTokens": 64000
   },
   {
+    "id": "gpt-5-xhigh",
+    "name": "GPT-5 Extra High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5-xhigh-fast",
+    "name": "GPT-5 Extra High Fast",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "gpt-5.1",
     "name": "GPT-5.1",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.1-codex",
+    "name": "GPT-5.1 Codex",
     "reasoning": false,
     "contextWindow": 200000,
     "maxTokens": 64000
@@ -574,6 +749,34 @@
     "maxTokens": 64000
   },
   {
+    "id": "gpt-5.5-high",
+    "name": "GPT-5.5 High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-low",
+    "name": "GPT-5.5 Low",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-medium",
+    "name": "GPT-5.5",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-5.5-xhigh",
+    "name": "GPT-5.5 Extra High",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
     "id": "grok-4-20",
     "name": "Grok 4.20",
     "reasoning": false,
@@ -583,6 +786,20 @@
   {
     "id": "grok-4-20-thinking",
     "name": "Grok 4.20 Thinking",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "grok-4-3",
+    "name": "Grok 4.3",
+    "reasoning": false,
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "grok-build-0.1",
+    "name": "Grok Build 0.1",
     "reasoning": false,
     "contextWindow": 200000,
     "maxTokens": 64000
